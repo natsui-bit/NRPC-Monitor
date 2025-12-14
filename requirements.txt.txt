@@ -1,0 +1,6 @@
+psutil
+pynvml
+wmi
+pystray
+Pillow
+pywin32
