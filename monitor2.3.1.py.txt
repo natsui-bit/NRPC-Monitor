@@ -1,0 +1,1065 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import psutil
+import pynvml
+import wmi
+import threading
+import time
+import pythoncom
+import json
+import os
+import sys
+import winreg
+from collections import deque
+import ctypes
+from ctypes import windll, byref, c_int, c_long
+from pathlib import Path
+
+# =============================================================================
+# 1. 初期設定・ライブラリロード
+# =============================================================================
+
+APP_NAME = "NRPC Monitor"
+CONFIG_DIR = Path(os.getenv("APPDATA")) / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+# --- High DPI対応 ---
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except:
+        pass
+
+# --- 定数定義 ---
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+
+# --- ライブラリチェック ---
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
+# =============================================================================
+# 2. Config & System Utils (設定・システム管理)
+# =============================================================================
+
+DEFAULT_CONFIG = {
+    "width": 420,
+    "height": 280,
+    "alpha": 0.95,
+    "always_on_top": True,
+    "theme": "dark",
+    "bar_mode": False,
+    "panels": [
+        {"type": "cpu", "style": "circle"},
+        {"type": "ram", "style": "circle"},
+        {"type": "gpu_0", "style": "circle"},
+        {"type": "disk_C:\\", "style": "circle"}
+    ]
+}
+
+def ensure_config_dir():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_config() -> dict:
+    ensure_config_dir()
+    if not CONFIG_PATH.is_file():
+        save_config(DEFAULT_CONFIG)
+        return DEFAULT_CONFIG.copy()
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 不足キーを補完
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in data:
+                data[k] = v
+        return data
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+def save_config(cfg: dict):
+    ensure_config_dir()
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+    except:
+        pass
+
+def check_startup_status() -> bool:
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+def toggle_startup_reg(enable: bool) -> bool:
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS) as key:
+            if enable:
+                exe = sys.executable
+                # PyInstallerでfrozen(exe化)されている場合のパス対応
+                if getattr(sys, "frozen", False):
+                    exe = sys.argv[0]
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+# =============================================================================
+# 3. UI Components (グラフ・パネル)
+# =============================================================================
+
+THEMES = {
+    "dark": {
+        "root_bg": "#0f0f0f", "panel_bg": "#181818",
+        "fg_title": "#888888", "fg_main": "#ffffff", "fg_sub": "#aaaaaa",
+        "ring_bg": "#2a2a2a", "grip": "#444444",
+        "colors": {
+            "cpu": "#00f3ff", "ram": "#00ff9d", "net": "#bd00ff", 
+            "clock": "#ffffff", "gpu": "#ff0055", "disk": "#ffde00",
+            "batt": "#ff9900", "alert": "#ff2a2a"
+        }
+    },
+    "light": {
+        "root_bg": "#f0f2f5", "panel_bg": "#ffffff",
+        "fg_title": "#555555", "fg_main": "#222222", "fg_sub": "#666666",
+        "ring_bg": "#e6e6e6", "grip": "#cccccc",
+        "colors": {
+            "cpu": "#007acc", "ram": "#109c58", "net": "#8e44ad", 
+            "clock": "#333333", "gpu": "#e74c3c", "disk": "#f1c40f",
+            "batt": "#f39c12", "alert": "#c0392b"
+        }
+    }
+}
+
+# --- 角丸化関数 (ここを追加しました！) ---
+def apply_round_corners(root):
+    try:
+        hwnd = windll.user32.GetParent(root.winfo_id())
+        windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, byref(c_int(2)), 4)
+    except: pass
+
+class Sizegrip(tk.Label):
+    def __init__(self, parent, target_window):
+        super().__init__(parent, text="◢", font=("Segoe UI", 10), cursor="sizing")
+        self.target = target_window
+        self.bind("<Button-1>", self.start_resize)
+        self.bind("<B1-Motion>", self.perform_resize)
+
+    def update_theme(self, t):
+        self.configure(bg=t["root_bg"], fg=t["grip"])
+
+    def start_resize(self, event):
+        self.start_x = event.x_root
+        self.start_y = event.y_root
+        self.start_w = self.target.winfo_width()
+        self.start_h = self.target.winfo_height()
+
+    def perform_resize(self, event):
+        delta_x = event.x_root - self.start_x
+        delta_y = event.y_root - self.start_y
+        new_w = max(100, self.start_w + delta_x)
+        new_h = max(40, self.start_h + delta_y)
+        self.target.geometry(f"{new_w}x{new_h}")
+
+class CircularProgress(tk.Canvas):
+    def __init__(self, parent, width=100, height=100, thickness=8):
+        super().__init__(parent, width=width, height=height, highlightthickness=0)
+        self.thickness = thickness
+        self.bg_ring_color = "#333333"
+        self.bar_color = "#00aaff"
+        self.text_color = "white"
+        
+        self.target_value = 0.0
+        self.current_value = 0.0
+        
+        pad = thickness / 2 + 5
+        self.coords = (pad, pad, width - pad, height - pad)
+        
+        self.bg_oval = self.create_oval(self.coords, width=thickness-4, outline=self.bg_ring_color)
+        self.arc = self.create_arc(self.coords, start=90, extent=0, width=thickness, style='arc', outline=self.bar_color)
+        self.text_id = self.create_text(width/2, height/2, text="0%", fill=self.text_color, font=("Segoe UI", 18, "bold"))
+        self.animate()
+
+    def update_theme(self, t):
+        self.configure(bg=t["panel_bg"])
+        self.bg_ring_color = t["ring_bg"]
+        self.text_color = t["fg_main"]
+        self.itemconfig(self.bg_oval, outline=self.bg_ring_color)
+        self.itemconfig(self.text_id, fill=self.text_color)
+
+    def set_value(self, value, text=None):
+        self.target_value = max(0, min(100, float(value)))
+        if text: self.itemconfig(self.text_id, text=text)
+        else: self.itemconfig(self.text_id, text=f"{int(self.target_value)}%")
+    
+    def set_color(self, color):
+        self.bar_color = color
+        self.itemconfig(self.arc, outline=color)
+
+    def animate(self):
+        diff = self.target_value - self.current_value
+        if abs(diff) > 0.1:
+            self.current_value += diff * 0.15
+        else:
+            self.current_value = self.target_value
+        extent = -(self.current_value / 100) * 360
+        self.itemconfig(self.arc, extent=extent)
+        self.after(16, self.animate)
+
+class LineChart(tk.Canvas):
+    def __init__(self, parent, width=100, height=100):
+        super().__init__(parent, width=width, height=height, highlightthickness=0)
+        self.line_color = "#00aaff"
+        self.text_color = "white"
+        self.data = deque([0]*50, maxlen=50)
+        self.width = width
+        self.height = height
+        self.text_id = self.create_text(width/2, height/2, text="0%", fill=self.text_color, font=("Segoe UI", 18, "bold"))
+
+    def update_theme(self, t):
+        self.configure(bg=t["panel_bg"])
+        self.text_color = t["fg_main"]
+        self.itemconfig(self.text_id, fill=self.text_color)
+        self.draw_chart()
+
+    def add_value(self, value, text=None):
+        self.data.append(value)
+        self.draw_chart()
+        if text: self.itemconfig(self.text_id, text=text)
+        else: self.itemconfig(self.text_id, text=f"{int(value)}%")
+        self.tag_raise(self.text_id)
+
+    def set_color(self, color):
+        self.line_color = color
+
+    def draw_chart(self):
+        self.delete("chart_elements")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 2: w = self.width
+        if h < 2: h = self.height
+        points = []
+        max_val = 100
+        step_x = w / (len(self.data) - 1) if len(self.data) > 1 else w
+        for i, val in enumerate(self.data):
+            x = i * step_x
+            y = h - (val / max_val * h)
+            points.append(x); points.append(y)
+        if len(points) >= 4:
+            self.create_line(points, fill=self.line_color, width=2, smooth=True, tags="chart_elements")
+            poly_points = points.copy()
+            poly_points.append(w); poly_points.append(h)
+            poly_points.append(0); poly_points.append(h)
+            self.create_polygon(poly_points, fill=self.line_color, outline="", stipple="gray25", tags="chart_elements")
+        self.tag_raise(self.text_id)
+
+class MonitorPanel(tk.Frame):
+    def __init__(self, parent, index, initial_config, app_instance):
+        super().__init__(parent, padx=2, pady=2, highlightthickness=0)
+        self.index = index
+        self.current_type = initial_config.get("type", "cpu")
+        self.current_style = initial_config.get("style", "circle")
+        self.app = app_instance
+        self.is_compact = False 
+        self.is_bar_mode = False 
+
+        self.inner = tk.Frame(self)
+        self.inner.pack(fill='both', expand=True, padx=2, pady=2)
+
+        self.title_label = tk.Label(self.inner, text="Loading...", font=("Segoe UI", 9, "bold"), anchor='w')
+        
+        # 通常モードコンテナ
+        self.content_frame = tk.Frame(self.inner)
+        self.center_box = tk.Frame(self.content_frame)
+        self.circle_graph = CircularProgress(self.center_box, width=80, height=80, thickness=10)
+        self.line_graph = LineChart(self.center_box, width=80, height=80)
+        
+        self.info_frame = tk.Frame(self.center_box)
+        self.main_text = tk.Label(self.info_frame, text="", font=("Segoe UI", 9), anchor='w')
+        self.sub_text = tk.Label(self.info_frame, text="", font=("Segoe UI", 7), anchor='w', justify='left')
+        self.main_text.pack(anchor='w')
+        self.sub_text.pack(anchor='w')
+
+        # ミニバー用ラベル
+        self.bar_text = tk.Label(self.inner, text="", font=("Segoe UI", 10, "bold"), anchor='w')
+
+        # 時計用
+        self.clock_frame = tk.Frame(self.inner)
+        self.clock_time = tk.Label(self.clock_frame, text="00:00", font=("Segoe UI", 28, "bold"))
+        self.clock_date = tk.Label(self.clock_frame, text="2000/01/01", font=("Segoe UI", 10))
+        self.clock_day = tk.Label(self.clock_frame, text="Monday", font=("Segoe UI", 9))
+
+        widgets = [self, self.inner, self.title_label, self.content_frame, self.center_box, 
+                   self.circle_graph, self.line_graph, self.info_frame, self.main_text, self.sub_text,
+                   self.bar_text, self.clock_frame, self.clock_time, self.clock_date, self.clock_day]
+        for w in widgets: w.bind("<Button-3>", self.show_menu)
+        
+        self.update_layout()
+
+    def update_theme(self, t):
+        self.configure(bg=t["root_bg"])
+        self.inner.configure(bg=t["panel_bg"])
+        
+        self.title_label.configure(bg=t["panel_bg"], fg=t["fg_title"])
+        self.content_frame.configure(bg=t["panel_bg"])
+        self.center_box.configure(bg=t["panel_bg"])
+        self.info_frame.configure(bg=t["panel_bg"])
+        self.main_text.configure(bg=t["panel_bg"], fg=t["fg_main"])
+        self.sub_text.configure(bg=t["panel_bg"], fg=t["fg_sub"])
+        self.bar_text.configure(bg=t["panel_bg"], fg=t["fg_main"])
+        
+        self.circle_graph.update_theme(t)
+        self.line_graph.update_theme(t)
+        
+        self.clock_frame.configure(bg=t["panel_bg"])
+        self.clock_time.configure(bg=t["panel_bg"], fg=t["fg_main"])
+        self.clock_date.configure(bg=t["panel_bg"], fg=t["fg_title"])
+        self.clock_day.configure(bg=t["panel_bg"], fg=t["fg_sub"])
+
+    def set_bar_mode(self, enabled):
+        self.is_bar_mode = enabled
+        self.update_layout()
+
+    def update_layout(self):
+        # 全非表示
+        self.title_label.pack_forget()
+        self.content_frame.pack_forget()
+        self.clock_frame.pack_forget()
+        self.circle_graph.pack_forget()
+        self.line_graph.pack_forget()
+        self.info_frame.pack_forget()
+        self.bar_text.pack_forget()
+
+        # --- ミニバーモード ---
+        if self.is_bar_mode:
+            self.inner.pack(fill='both', expand=True, padx=0, pady=0)
+            self.title_label.pack(side='left', padx=(5, 2))
+            
+            if self.current_type == "clock":
+                self.clock_frame.pack(side='left')
+                self.clock_time.configure(font=("Segoe UI", 12, "bold"))
+                self.clock_time.pack(side='left', padx=5)
+                self.clock_date.pack_forget()
+                self.clock_day.pack_forget()
+            else:
+                self.bar_text.pack(side='left', padx=2)
+            return
+
+        # --- 通常モード ---
+        self.inner.pack(fill='both', expand=True, padx=2, pady=2)
+
+        if self.current_type == "clock":
+            self.clock_frame.pack(expand=True)
+            self.clock_time.configure(font=("Segoe UI", 28, "bold"))
+            self.clock_time.pack(anchor="center")
+            self.clock_date.pack(anchor="center", pady=(5,0))
+            self.clock_day.pack(anchor="center")
+            return
+
+        self.title_label.pack(fill='x', padx=5, pady=(5,0))
+        self.content_frame.pack(expand=True, fill='both')
+        self.center_box.pack(anchor="center", expand=True)
+
+        self.main_text.configure(font=("Segoe UI", 9))
+        self.main_text.pack(anchor='w')
+        self.sub_text.pack(anchor='w')
+
+        if self.is_compact:
+            self.info_frame.pack(side='left', padx=5, fill='y')
+        else:
+            if self.current_style == "line": 
+                self.line_graph.pack(side='left', padx=5, fill="both", expand=True)
+            else: 
+                self.circle_graph.pack(side='left', padx=5)
+            self.info_frame.pack(side='left', padx=10, fill='y')
+
+    def set_mode(self, compact):
+        if self.is_compact == compact and not self.is_bar_mode: return
+        self.is_compact = compact
+        self.update_layout()
+        
+        if compact and not self.is_bar_mode:
+            self.clock_time.configure(font=("Segoe UI", 18, "bold"))
+            self.clock_date.configure(font=("Segoe UI", 9))
+        elif not self.is_bar_mode:
+            self.clock_time.configure(font=("Segoe UI", 28, "bold"))
+            self.clock_date.configure(font=("Segoe UI", 10))
+
+    def show_menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        
+        # 1. 表示切替
+        type_menu = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="表示切替", menu=type_menu)
+        type_menu.add_command(label="CPU", command=lambda: self.change_type("cpu"))
+        type_menu.add_command(label="RAM (メモリ)", command=lambda: self.change_type("ram"))
+        for i, name in self.app.gpu_names.items():
+            type_menu.add_command(label=f"GPU {i}: {name}", command=lambda i=i: self.change_type(f"gpu_{i}"))
+        for dp in psutil.disk_partitions():
+            if 'cdrom' in dp.opts or dp.fstype == '': continue
+            try: type_menu.add_command(label=f"Disk ({dp.device})", command=lambda d=dp.device: self.change_type(f"disk_{d}"))
+            except: pass
+        type_menu.add_command(label="ネットワーク", command=lambda: self.change_type("net"))
+        type_menu.add_command(label="バッテリー", command=lambda: self.change_type("batt"))
+        type_menu.add_command(label="時計・日付", command=lambda: self.change_type("clock"))
+        
+        # 2. グラフスタイル
+        if self.current_type != "clock" and not self.app.is_bar_mode:
+            style_menu = tk.Menu(menu, tearoff=0)
+            menu.add_cascade(label="グラフスタイル", menu=style_menu)
+            style_menu.add_radiobutton(label="円グラフ", value="circle", variable=tk.StringVar(value=self.current_style), command=lambda: self.change_style("circle"))
+            style_menu.add_radiobutton(label="折れ線グラフ", value="line", variable=tk.StringVar(value=self.current_style), command=lambda: self.change_style("line"))
+
+        # 3. 表示モード
+        mode_menu = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="表示モード", menu=mode_menu)
+        mode_menu.add_command(label=f"{'✔ ' if not self.app.is_bar_mode else '   '}通常モード", command=lambda: self.app.set_view_mode(False))
+        mode_menu.add_command(label=f"{'✔ ' if self.app.is_bar_mode else '   '}ミニ・バー (Bar Mode)", command=lambda: self.app.set_view_mode(True))
+
+        # 4. 表示数
+        count_menu = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="表示数", menu=count_menu)
+        current_count = len(self.app.panels)
+        for n in range(1, 9):
+            label = f"{n}個"
+            if n == current_count: label = "✔ " + label
+            else: label = "   " + label
+            count_menu.add_command(label=label, command=lambda n=n: self.app.set_panel_count(n))
+
+        # 5. 表示色
+        theme_menu = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="表示色", menu=theme_menu)
+        theme_menu.add_radiobutton(label="ダーク (Dark)", value="dark", variable=tk.StringVar(value=self.app.theme_mode), command=lambda: self.app.set_theme("dark"))
+        theme_menu.add_radiobutton(label="ライト (Light)", value="light", variable=tk.StringVar(value=self.app.theme_mode), command=lambda: self.app.set_theme("light"))
+
+        # 6. 透過率
+        opacity_menu = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="透過率", menu=opacity_menu)
+        for val in [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]:
+            label_text = f"{int(val * 100)}%"
+            if val == 1.0: label_text += " (不透明)"
+            opacity_menu.add_command(label=label_text, command=lambda v=val: self.app.set_opacity(v))
+
+        # 7. 最前面
+        is_top = self.app.always_on_top
+        menu.add_command(label=f"{'✔ ' if is_top else '   '}最前面に表示", command=self.app.toggle_topmost)
+        
+        # 8. クリックスルー
+        is_ct = self.app.is_click_through
+        menu.add_command(label=f"{'✔ ' if is_ct else '   '}操作を透過 (Click Through)", command=self.app.toggle_click_through)
+
+        # 9. スタートアップ
+        is_startup = check_startup_status()
+        menu.add_command(label=f"{'✔ ' if is_startup else '   '}スタートアップ", command=self.app.toggle_startup)
+
+        # 10. トレイ最小化
+        if TRAY_AVAILABLE:
+            menu.add_command(label="タスクトレイに最小化", command=self.app.minimize_to_tray)
+
+        menu.add_separator()
+        menu.add_command(label="アプリを閉じる", command=self.app.quit_app)
+        menu.post(event.x_root, event.y_root)
+
+    def change_type(self, new_type):
+        self.current_type = new_type
+        self.app.update_panel_config(self.index, type=new_type)
+        self.update_layout()
+
+    def change_style(self, new_style):
+        self.current_style = new_style
+        self.app.update_panel_config(self.index, style=new_style)
+        self.update_layout()
+
+    def update_display(self, data_dict):
+        type_key = self.current_type
+        t_colors = THEMES[self.app.theme_mode]["colors"]
+        
+        if type_key == "clock":
+            now = time.localtime()
+            t_str = time.strftime("%H:%M:%S", now)
+            if self.is_bar_mode:
+                self.clock_time.config(text=t_str)
+            else:
+                d_str = time.strftime("%Y/%m/%d", now)
+                day_str = time.strftime("%A", now)
+                self.clock_time.config(text=t_str)
+                self.clock_date.config(text=d_str)
+                self.clock_day.config(text=day_str)
+            return
+
+        base_color = t_colors.get("cpu")
+        if type_key == "cpu": base_color = t_colors["cpu"]
+        elif type_key == "ram": base_color = t_colors["ram"]
+        elif type_key == "net": base_color = t_colors["net"]
+        elif type_key == "batt": base_color = t_colors["batt"]
+        elif type_key.startswith("gpu"): base_color = t_colors["gpu"]
+        elif type_key.startswith("disk"): base_color = t_colors["disk"]
+
+        val_percent = 0
+        is_alert = False
+
+        if type_key == "cpu":
+            d = data_dict.get("cpu", {})
+            self.title_label.config(text="CPU")
+            val_percent = d.get("percent", 0)
+            temp = d.get("temp", "--")
+            temp_raw = d.get("temp_raw", 0)
+            t_display = f"{temp}°C"
+            if d.get("is_simulated", False): t_display += "*"
+            
+            if self.is_bar_mode:
+                self.bar_text.config(text=f"{val_percent}%  {t_display}")
+            else:
+                self.title_label.config(text=d.get("name", "CPU"))
+                self.main_text.config(text=f"Temp: {t_display}")
+                self.sub_text.config(text=f"Proc: {d.get('procs', 0)}\nUp: {d.get('uptime', '--')}")
+            
+            if val_percent > 90 or (temp_raw > 85): is_alert = True
+            
+        elif type_key == "ram":
+            d = data_dict.get("ram", {})
+            self.title_label.config(text="RAM")
+            val_percent = d.get("percent", 0)
+            if self.is_bar_mode:
+                self.bar_text.config(text=f"{val_percent}%  {d.get('used_gb')}GB")
+            else:
+                self.main_text.config(text=f"{d.get('used_gb', 0)} / {d.get('total_gb', 0)} GB")
+                self.sub_text.config(text=f"Avail: {d.get('avail_gb', 0)} GB")
+            if val_percent > 90: is_alert = True
+            
+        elif type_key.startswith("gpu_"):
+            idx = int(type_key.split("_")[1])
+            d = data_dict.get("gpus", {}).get(idx, {})
+            name = d.get("name", f"GPU {idx}")
+            val_percent = d.get("percent", 0)
+            temp = d.get("temp", "N/A")
+            temp_raw = d.get("temp_raw", 0)
+            pwr_val = d.get('power', '--')
+            pwr_str = f"{pwr_val}W" if pwr_val != "--" else "-- W"
+
+            if self.is_bar_mode:
+                self.title_label.config(text="GPU")
+                self.bar_text.config(text=f"{val_percent}%  {temp}°C")
+            else:
+                if len(name) > 22: name = name[:20] + ".."
+                self.title_label.config(text=name)
+                self.main_text.config(text=f"{temp}°C  {d.get('clock', '0')}MHz")
+                self.sub_text.config(text=f"VRAM: {d.get('vram_used', '0')}/{d.get('vram_total', '0')}GB\nFan: {d.get('fan', 'N/A')}%\nPwr: {pwr_str}")
+            
+            if val_percent > 95 or (temp_raw > 85): is_alert = True
+            
+        elif type_key.startswith("disk_"):
+            device = type_key.split("_", 1)[1]
+            d = data_dict.get("disks", {}).get(device, {})
+            self.title_label.config(text=f"Disk ({device})")
+            val_percent = d.get("percent", 0)
+            if self.is_bar_mode:
+                self.bar_text.config(text=f"{val_percent}% Used")
+            else:
+                self.main_text.config(text=f"{d.get('used_gb', 0)} / {d.get('total_gb', 0)} GB")
+                self.sub_text.config(text=f"R: {d.get('read_speed', 0)} MB/s\nW: {d.get('write_speed', 0)} MB/s")
+            if val_percent > 95: is_alert = True
+            
+        elif type_key == "net":
+            d = data_dict.get("net", {})
+            self.title_label.config(text="NET")
+            dl = d.get("down_mb", 0)
+            ul = d.get("up_mb", 0)
+            val_percent = min(100, (dl + ul) * 5) 
+            if self.is_bar_mode:
+                self.bar_text.config(text=f"↓{dl:.1f}  ↑{ul:.1f} MB/s")
+            else:
+                self.title_label.config(text="Network")
+                self.main_text.config(text=f"↓ {dl:.1f} MB/s")
+                self.sub_text.config(text=f"↑ {ul:.1f} MB/s\nTotal: {d.get('sent_total', 0)} GB")
+            self.circle_graph.set_value(val_percent, text="NET")
+            self.line_graph.add_value(val_percent, text="NET")
+            self.circle_graph.set_color(base_color)
+            self.line_graph.set_color(base_color)
+            return
+            
+        elif type_key == "batt":
+            d = data_dict.get("batt", {})
+            self.title_label.config(text="BATT")
+            val_percent = d.get("percent", 0)
+            plugged = d.get("plugged", False)
+            status = "Charging" if plugged else "Battery"
+            if self.is_bar_mode:
+                self.bar_text.config(text=f"{val_percent}% ({status})")
+            else:
+                self.title_label.config(text="Battery")
+                self.main_text.config(text=f"{val_percent}%")
+                self.sub_text.config(text=f"{status}\n{d.get('time_left', '--')}")
+            if not plugged and val_percent < 20: is_alert = True
+
+        final_color = t_colors["alert"] if is_alert else base_color
+        self.circle_graph.set_color(final_color)
+        self.line_graph.set_color(final_color)
+        self.circle_graph.set_value(val_percent)
+        self.line_graph.add_value(val_percent)
+
+# =============================================================================
+# 4. Application Logic (メインアプリロジック)
+# =============================================================================
+
+class SystemMonitorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_NAME)
+        
+        self.config = load_config()
+        self.normal_width = self.config.get("width", 420)
+        self.normal_height = self.config.get("height", 280)
+        
+        self.is_bar_mode = self.config.get("bar_mode", False)
+        
+        # スタート時のサイズ
+        if self.is_bar_mode:
+            w, h = self.normal_width, 50 
+        else:
+            w, h = self.normal_width, self.normal_height
+            
+        self.root.geometry(f"{w}x{h}")
+        
+        self.always_on_top = self.config.get("always_on_top", True)
+        self.theme_mode = self.config.get("theme", "dark")
+        self.is_click_through = False
+        
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", self.always_on_top)
+        self.root.attributes("-alpha", self.config.get("alpha", 0.95))
+        
+        self.root.bind("<Button-1>", self.start_move)
+        self.root.bind("<ButtonRelease-1>", self.stop_move)
+        self.root.bind("<B1-Motion>", self.on_motion)
+        
+        self.resize_timer = None
+        self.last_cols = None 
+        self.root.bind("<Configure>", self.on_window_configure)
+
+        self.sizegrip = Sizegrip(root, root)
+        self.sizegrip.place(relx=1.0, rely=1.0, anchor="se")
+
+        # GPU初期化
+        self.gpu_available = False
+        self.gpu_names = {}
+        try:
+            pynvml.nvmlInit()
+            self.gpu_available = True
+            count = pynvml.nvmlDeviceGetCount()
+            for i in range(count):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                n = pynvml.nvmlDeviceGetName(h)
+                if isinstance(n, bytes): n = n.decode("utf-8")
+                n = n.replace("NVIDIA", "").replace("GeForce", "").strip()
+                self.gpu_names[i] = n
+        except: pass
+
+        self.container = tk.Frame(root)
+        self.container.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self.panels = []
+        # Configからパネル生成
+        for i, p_conf in enumerate(self.config.get("panels", [])):
+            self.add_panel_instance(i, p_conf)
+
+        self.apply_theme()
+        self.root.update_idletasks()
+        apply_round_corners(self.root)
+        self.rearrange_panels()
+
+        self.last_net = psutil.net_io_counters()
+        self.last_disk = psutil.disk_io_counters()
+        self.last_time = time.time()
+        self.max_clock_cache = None 
+        
+        self.running = True
+        self.thread = threading.Thread(target=self.update_stats, daemon=True)
+        self.thread.start()
+
+        self.tray_icon = None
+
+    def add_panel_instance(self, idx, conf):
+        panel = MonitorPanel(self.container, idx, conf, self)
+        self.panels.append(panel)
+        t = THEMES[self.theme_mode]
+        panel.update_theme(t)
+
+    def update_panel_config(self, index, type=None, style=None):
+        if 0 <= index < len(self.config["panels"]):
+            if type: self.config["panels"][index]["type"] = type
+            if style: self.config["panels"][index]["style"] = style
+            save_config(self.config)
+
+    def set_panel_count(self, count):
+        current = len(self.panels)
+        if count == current: return
+        
+        panel_list = self.config["panels"]
+        
+        if count > current:
+            # 増やす
+            defaults = ["cpu", "ram", "gpu_0", "disk_C:\\", "net", "clock", "batt", "gpu_1"]
+            for i in range(current, count):
+                def_type = defaults[i] if i < len(defaults) else "cpu"
+                new_conf = {"type": def_type, "style": "circle"}
+                panel_list.append(new_conf)
+                self.add_panel_instance(i, new_conf)
+        else:
+            # 減らす
+            for i in range(current - 1, count - 1, -1):
+                panel = self.panels.pop()
+                panel.destroy()
+                panel_list.pop()
+        
+        self.rearrange_panels()
+        save_config(self.config)
+
+    def set_view_mode(self, bar_mode):
+        if self.is_bar_mode == bar_mode: return
+        
+        if bar_mode:
+            self.normal_width = self.root.winfo_width()
+            self.normal_height = self.root.winfo_height()
+            self.is_bar_mode = True
+            self.config["bar_mode"] = True
+            self.rearrange_panels()
+            self.root.after(50, lambda: self.root.geometry(f"{self.normal_width}x50"))
+        else:
+            self.is_bar_mode = False
+            self.config["bar_mode"] = False
+            self.root.geometry(f"{self.normal_width}x{self.normal_height}")
+            self.rearrange_panels()
+            
+        save_config(self.config)
+
+    def toggle_click_through(self):
+        self.is_click_through = not self.is_click_through
+        hwnd = windll.user32.GetParent(self.root.winfo_id())
+        if self.is_click_through:
+            style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = style | WS_EX_TRANSPARENT | WS_EX_LAYERED
+            windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            messagebox.showinfo("透過モードON", "操作透過モードになりました。\n解除するにはタスクトレイアイコンを右クリックしてください。")
+        else:
+            style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = style & ~WS_EX_TRANSPARENT
+            windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+    def toggle_click_through_from_tray(self, icon=None, item=None):
+        if self.is_click_through:
+            self.toggle_click_through()
+
+    def on_motion(self, event):
+        if self.x is None: return 
+        deltax = event.x - self.x
+        deltay = event.y - self.y
+        new_x = self.root.winfo_x() + deltax
+        new_y = self.root.winfo_y() + deltay
+        self.root.geometry(f"+{new_x}+{new_y}")
+
+    def toggle_startup(self):
+        cur = check_startup_status()
+        if toggle_startup_reg(not cur):
+            pass
+        else:
+            messagebox.showerror(APP_NAME, "スタートアップ設定の変更に失敗しました。")
+
+    def minimize_to_tray(self):
+        if not TRAY_AVAILABLE: return
+        self.root.withdraw()
+        # アイコン生成 (簡易的な円描画)
+        image = Image.new('RGB', (64, 64), color=(20, 20, 20))
+        d = ImageDraw.Draw(image)
+        d.ellipse((10, 10, 54, 54), fill="#00f3ff")
+        
+        menu_items = [
+            pystray.MenuItem("開く", self.restore_from_tray),
+            pystray.MenuItem("終了", self.quit_app)
+        ]
+        if self.is_click_through:
+            menu_items.insert(0, pystray.MenuItem("操作透過を解除", self.toggle_click_through_from_tray))
+
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, pystray.Menu(*menu_items))
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def restore_from_tray(self, icon=None, item=None):
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None
+        self.root.after(0, self.root.deiconify)
+
+    def set_theme(self, mode):
+        self.theme_mode = mode
+        self.config["theme"] = mode
+        self.apply_theme()
+        save_config(self.config)
+
+    def apply_theme(self):
+        t = THEMES[self.theme_mode]
+        self.root.configure(bg=t["root_bg"])
+        self.container.configure(bg=t["root_bg"])
+        self.sizegrip.update_theme(t)
+        for p in self.panels:
+            p.update_theme(t)
+
+    def toggle_topmost(self):
+        self.always_on_top = not self.always_on_top
+        self.root.attributes("-topmost", self.always_on_top)
+        self.config["always_on_top"] = self.always_on_top
+        save_config(self.config)
+
+    def set_opacity(self, value):
+        self.root.attributes("-alpha", value)
+        self.config["alpha"] = value
+        save_config(self.config)
+
+    def on_window_configure(self, event):
+        if event.widget == self.root and not self.is_bar_mode:
+            if self.resize_timer:
+                self.root.after_cancel(self.resize_timer)
+            self.normal_width = event.width
+            self.normal_height = event.height
+            self.config["width"] = event.width
+            self.config["height"] = event.height
+            self.resize_timer = self.root.after(100, self.rearrange_panels)
+
+    def rearrange_panels(self):
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        
+        if self.is_bar_mode:
+            cols = len(self.panels)
+            rows = 1
+        else:
+            if h == 0: return
+            ratio = w / h
+            if ratio > 2.2: cols = 4 
+            elif ratio < 0.45: cols = 1 
+            else: cols = 2 
+            num_panels = len(self.panels)
+            rows = (num_panels + cols - 1) // cols
+
+        panel_w = w / cols if cols > 0 else 1
+        compact_mode = (panel_w < 130)
+
+        for panel in self.panels:
+            panel.set_bar_mode(self.is_bar_mode)
+            panel.set_mode(compact_mode)
+            panel.grid_forget()
+
+        for i in range(8):
+            self.container.grid_columnconfigure(i, weight=0)
+            self.container.grid_rowconfigure(i, weight=0)
+        
+        for i, panel in enumerate(self.panels):
+            if self.is_bar_mode:
+                r, c = 0, i
+            else:
+                r = i // cols
+                c = i % cols
+            panel.grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
+
+        for c in range(cols): self.container.grid_columnconfigure(c, weight=1)
+        for r in range(rows): self.container.grid_rowconfigure(r, weight=1)
+        self.last_cols = cols
+
+    def quit_app(self, icon=None, item=None):
+        if self.tray_icon: self.tray_icon.stop()
+        # 終了時にサイズ保存
+        self.config["width"] = self.normal_width
+        self.config["height"] = self.normal_height
+        save_config(self.config)
+        self.root.destroy()
+        sys.exit()
+
+    def start_move(self, event):
+        self.x = event.x
+        self.y = event.y
+    def stop_move(self, event):
+        self.x = None
+        self.y = None
+        save_config(self.config)
+
+    def update_gui_safe(self, data):
+        for panel in self.panels:
+            panel.update_display(data)
+
+    def update_stats(self):
+        pythoncom.CoInitialize()
+        try: w_general = wmi.WMI()
+        except: w_general = None
+        try: w_temp = wmi.WMI(namespace=r"root\wmi")
+        except: w_temp = None
+        
+        cpu_name_str = "CPU"
+        if w_general:
+            try:
+                raw = w_general.Win32_Processor()[0].Name
+                cpu_name_str = raw.replace("Intel(R)", "").replace("Core(TM)", "").replace("AMD", "").replace("Processor", "").strip()
+            except: pass
+
+        while self.running:
+            try:
+                data = {}
+                cpu_per = psutil.cpu_percent(interval=None)
+                
+                # CPU Temp
+                cpu_temp = 0
+                temp_found = False
+                if not temp_found and w_temp:
+                    try:
+                        temps = w_temp.MSAcpi_ThermalZoneTemperature()
+                        if temps: 
+                            t_val = int((temps[0].CurrentTemperature / 10.0) - 273.15)
+                            if t_val != 27 and t_val > 0:
+                                cpu_temp = t_val
+                                temp_found = True
+                    except: pass
+                if not temp_found or cpu_temp == 0:
+                    cpu_temp = int(35 + (cpu_per * 0.5)) 
+                    is_simulated = True
+                else:
+                    is_simulated = False
+
+                # CPU Clock (Task Manager Logic)
+                cpu_clk_val = 0
+                if w_general:
+                    try:
+                        if not self.max_clock_cache:
+                            procs = w_general.Win32_Processor()
+                            if procs: self.max_clock_cache = procs[0].MaxClockSpeed
+                        perf = w_general.Win32_PerfFormattedData_Counters_ProcessorInformation(Name="_Total")
+                        if perf and self.max_clock_cache:
+                            p_val = perf[0].PercentProcessorPerformance
+                            cpu_clk_val = self.max_clock_cache * (p_val / 100.0)
+                    except: pass
+                if cpu_clk_val == 0:
+                    try:
+                        freq = psutil.cpu_freq()
+                        if freq:
+                            cpu_clk_val = freq.current
+                            if cpu_clk_val == 0: cpu_clk_val = freq.max
+                    except: pass
+                
+                if cpu_clk_val > 1000: cpu_clk_str = f"{cpu_clk_val/1000:.2f}GHz" 
+                else: cpu_clk_str = f"{cpu_clk_val:.0f}MHz"
+
+                try: procs = len(psutil.pids())
+                except: procs = 0
+                try: 
+                    uptime_sec = time.time() - psutil.boot_time()
+                    uptime = time.strftime("%H:%M:%S", time.gmtime(uptime_sec))
+                except: uptime = "--"
+
+                data["cpu"] = {
+                    "percent": cpu_per, "temp": cpu_temp, "temp_raw": cpu_temp,
+                    "is_simulated": is_simulated, "clock": cpu_clk_str, 
+                    "name": cpu_name_str, "procs": procs, "uptime": uptime
+                }
+
+                mem = psutil.virtual_memory()
+                data["ram"] = {
+                    "percent": mem.percent, "used_gb": f"{mem.used // (1024**3)}", 
+                    "total_gb": f"{mem.total // (1024**3)}", "avail_gb": f"{mem.available // (1024**3)}"
+                }
+
+                try:
+                    batt = psutil.sensors_battery()
+                    if batt:
+                        secs = batt.secsleft
+                        if secs == psutil.POWER_TIME_UNLIMITED: time_left = "AC Power"
+                        elif secs == psutil.POWER_TIME_UNKNOWN: time_left = "Calculating..."
+                        else: time_left = f"{secs//3600}h {secs%3600//60}m"
+                        data["batt"] = {"percent": batt.percent, "plugged": batt.power_plugged, "time_left": time_left}
+                    else:
+                        data["batt"] = {"percent": 0, "plugged": True, "time_left": "No Battery"}
+                except:
+                    data["batt"] = {"percent": 0, "plugged": True, "time_left": "No Battery"}
+
+                gpus_data = {}
+                if self.gpu_available:
+                    for i in self.gpu_names.keys():
+                        try:
+                            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                            u = pynvml.nvmlDeviceGetUtilizationRates(h)
+                            t = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+                            clk = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)
+                            mem_info = pynvml.nvmlDeviceGetMemoryInfo(h)
+                            vram_used = f"{mem_info.used / (1024**3):.1f}"
+                            vram_total = f"{mem_info.total / (1024**3):.0f}"
+                            try: fan = pynvml.nvmlDeviceGetFanSpeed(h)
+                            except: fan = "N/A"
+                            power = "--"
+                            try: power = pynvml.nvmlDeviceGetPowerUsage(h) // 1000
+                            except:
+                                try:
+                                    limit = pynvml.nvmlDeviceGetEnforcedPowerLimit(h)
+                                    power = int((limit / 1000) * (u.gpu / 100.0))
+                                except: pass
+                            gpus_data[i] = {
+                                "percent": u.gpu, "temp": t, "temp_raw": t, "clock": clk, 
+                                "vram_used": vram_used, "vram_total": vram_total, 
+                                "fan": fan, "power": power, "name": self.gpu_names[i]
+                            }
+                        except: pass
+                data["gpus"] = gpus_data
+
+                disks_data = {}
+                for dp in psutil.disk_partitions():
+                    if 'cdrom' in dp.opts or dp.fstype == '': continue
+                    try:
+                        usage = psutil.disk_usage(dp.device)
+                        curr_disk = psutil.disk_io_counters()
+                        read_speed = 0
+                        write_speed = 0
+                        if self.last_disk:
+                            elapsed = time.time() - self.last_time
+                            if elapsed > 0:
+                                read_speed = (curr_disk.read_bytes - self.last_disk.read_bytes) / (1024*1024) / elapsed
+                                write_speed = (curr_disk.write_bytes - self.last_disk.write_bytes) / (1024*1024) / elapsed
+                        disks_data[dp.device] = {
+                            "percent": usage.percent, "free_gb": usage.free // (1024**3), 
+                            "total_gb": usage.total // (1024**3), "used_gb": usage.used // (1024**3),
+                            "read_speed": f"{read_speed:.1f}", "write_speed": f"{write_speed:.1f}"
+                        }
+                        self.last_disk = curr_disk
+                    except: pass
+                data["disks"] = disks_data
+
+                curr_net = psutil.net_io_counters()
+                curr_time = time.time()
+                elapsed = curr_time - self.last_time
+                if elapsed > 0:
+                    down_mb = (curr_net.bytes_recv - self.last_net.bytes_recv) / (1024*1024) / elapsed
+                    up_mb = (curr_net.bytes_sent - self.last_net.bytes_sent) / (1024*1024) / elapsed
+                    data["net"] = {"down_mb": down_mb, "up_mb": up_mb, "sent_total": f"{curr_net.bytes_sent // (1024**3)}"}
+                self.last_net = curr_net
+                self.last_time = curr_time
+
+                self.root.after(0, self.update_gui_safe, data)
+
+            except Exception as e: print(e)
+            time.sleep(1)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SystemMonitorApp(root)
+    root.mainloop()
